@@ -1,0 +1,24 @@
+[package]
+name = "citlali"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Image optimization server: resize, crop and re-encode JPEG / PNG / WebP / AVIF with libvips"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+axum = "0.8.9"
+prometheus = { version = "0.14.0", default-features = false, features = ["process"] }
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.21"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+
+[build-dependencies]
+pkg-config = "0.3.34"
+
+[lints.clippy]
+all = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
