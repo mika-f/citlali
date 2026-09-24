@@ -2,6 +2,7 @@
 
 use serde::Deserialize;
 
+use crate::face;
 use crate::vips::{Image, Size, VipsError};
 
 pub const MAX_DIMENSION: u32 = 8192;
@@ -14,6 +15,9 @@ const BLUR_DOWNSCALE: i32 = 8;
 /// costs ~40% bytes over 6 for ~80% less CPU, and still beats WebP on size.
 pub const DEFAULT_AVIF_SPEED: u8 = 9;
 pub const MAX_AVIF_SPEED: u8 = 9;
+/// Faces are searched for on a copy this many pixels on its long edge; the smallest face found is
+/// 24 px there, so about 5% of the long edge.
+const FACE_DETECT_SIZE: i32 = 512;
 /// Stands in for "no limit" on an axis; below `VIPS_MAX_COORD` on every libvips version.
 const UNBOUNDED: i32 = 10_000_000;
 
@@ -126,12 +130,25 @@ pub enum Fit {
     Blur,
 }
 
+/// What `cover` and `crop` keep in frame.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Gravity {
+    #[default]
+    #[serde(alias = "center")]
+    Centre,
+    /// Centre on the most confident (anime-style) face; falls back to `centre` if none is found.
+    Face,
+}
+
 #[derive(Debug, Default, Deserialize)]
 pub struct Params {
     pub width: Option<u32>,
     pub height: Option<u32>,
     #[serde(default)]
     pub fit: Fit,
+    #[serde(default)]
+    pub gravity: Gravity,
     pub quality: Option<u8>,
     /// Defaults to the input format.
     pub format: Option<Format>,
@@ -174,8 +191,8 @@ pub fn transform(input: &[u8], params: &Params, config: Config) -> Result<Output
     drop(header);
 
     let image = match (params.fit, params.width.is_some() && params.height.is_some()) {
-        (Fit::Cover, true) => Image::thumbnail(input, w, h, Size::Both, true)?,
-        (Fit::Crop, true) => Image::thumbnail(input, w, h, Size::Down, true)?,
+        (Fit::Cover, true) => fill(input, w, h, Size::Both, params.gravity)?,
+        (Fit::Crop, true) => fill(input, w, h, Size::Down, params.gravity)?,
         (Fit::Blur, true) => blur(input, w, h)?,
         // Without a full box there is nothing to fill, so every fit degrades to scale-down.
         _ => Image::thumbnail(input, w, h, Size::Down, false)?,
@@ -184,6 +201,52 @@ pub fn transform(input: &[u8], params: &Params, config: Config) -> Result<Output
     let format = params.format.unwrap_or(source);
     let bytes = image.save(&format.save_suffix(params.quality, config.avif_speed))?;
     Ok(Output { format, bytes })
+}
+
+/// Resizes to cover the `w`x`h` box (as far as `size` allows) and crops the overflow around
+/// `gravity`.
+fn fill(input: &[u8], w: i32, h: i32, size: Size, gravity: Gravity) -> Result<Image<'_>, VipsError> {
+    let focus = match gravity {
+        Gravity::Centre => None,
+        Gravity::Face => face_focus(input)?,
+    };
+    match focus {
+        None => Image::thumbnail(input, w, h, size, true),
+        Some(focus) => crop_around(input, w, h, size, focus),
+    }
+}
+
+/// Centre of the most confident face, as fractions of the image's width and height.
+fn face_focus(input: &[u8]) -> Result<Option<(f64, f64)>, VipsError> {
+    // ponytail: decodes the input a second time; cheap with shrink-on-load (JPEG, WebP), a full
+    // extra decode for PNG and AVIF. Share one in-memory decode if that shows up in latency.
+    let grey = Image::thumbnail(input, FACE_DETECT_SIZE, FACE_DETECT_SIZE, Size::Down, false)?
+        // Equalising reads the image twice (histogram, then mapping); the input decodes sequentially.
+        .copy_memory()?
+        .equalised_grey()?;
+    let (w, h) = (grey.width(), grey.height());
+    let focus = face::detect(&grey.pixels()?, w as usize);
+    Ok(focus.map(|(x, y)| (x / f64::from(w), y / f64::from(h))))
+}
+
+/// Like `thumbnail` with `crop`, but the crop is centred on `focus` (fractions of width and
+/// height) as far as the image edges allow.
+fn crop_around(input: &[u8], w: i32, h: i32, size: Size, focus: (f64, f64)) -> Result<Image<'_>, VipsError> {
+    let header = Image::header(input)?;
+    let (iw, ih) = (i64::from(header.width()), i64::from(header.height()));
+    let (iw, ih) = if header.orientation_swaps() { (ih, iw) } else { (iw, ih) };
+    drop(header);
+    // Fit the axis that needs the larger scale exactly; the other one overflows the box.
+    let image = if i64::from(w) * ih >= i64::from(h) * iw {
+        Image::thumbnail(input, w, UNBOUNDED, size, false)?
+    } else {
+        Image::thumbnail(input, UNBOUNDED, h, size, false)?
+    };
+    let (iw, ih) = (image.width(), image.height());
+    let (cw, ch) = (w.min(iw), h.min(ih));
+    let offset =
+        |centre: f64, extent: i32, crop: i32| ((centre * f64::from(extent)) as i32 - crop / 2).clamp(0, extent - crop);
+    image.extract_area(offset(focus.0, iw, cw), offset(focus.1, ih, ch), cw, ch)
 }
 
 fn blur(input: &[u8], w: i32, h: i32) -> Result<Image<'_>, VipsError> {
@@ -256,6 +319,25 @@ mod tests {
     #[test]
     fn cover_without_height_degrades_to_scale_down() {
         assert_eq!(output_size(&png(400, 200), &params(Fit::Cover, Some(800), None)), (400, 200));
+    }
+
+    #[test]
+    fn face_gravity_without_a_face_still_fills_box() {
+        let params = Params { gravity: Gravity::Face, ..params(Fit::Cover, Some(100), Some(100)) };
+        assert_eq!(output_size(&png(400, 200), &params), (100, 100));
+    }
+
+    #[test]
+    fn crop_around_keeps_focus_in_frame() {
+        vips::init().unwrap();
+        // Black left half, white right half: focusing near the right edge must show (almost) only white,
+        // where a centre crop would be half black.
+        let white = Image::black(100, 100).unwrap().invert().unwrap();
+        let input = Image::black(200, 100).unwrap().insert(&white, 100, 0).unwrap().save(".png").unwrap();
+        let out = crop_around(&input, 50, 50, Size::Both, (0.95, 0.5)).unwrap();
+        assert_eq!((out.width(), out.height()), (50, 50));
+        let pixels = out.pixels().unwrap();
+        assert!(pixels.iter().map(|&p| usize::from(p)).sum::<usize>() / pixels.len() > 240);
     }
 
     #[test]
