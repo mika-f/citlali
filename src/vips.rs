@@ -21,6 +21,7 @@ unsafe extern "C" {
     fn vips_image_new_from_buffer(buf: *const c_void, len: usize, option_string: *const c_char, ...) -> *mut VipsImage;
     fn vips_image_get_width(image: *const VipsImage) -> c_int;
     fn vips_image_get_height(image: *const VipsImage) -> c_int;
+    fn vips_image_get_orientation_swap(image: *mut VipsImage) -> c_int;
     fn vips_thumbnail_buffer(buf: *mut c_void, len: usize, out: *mut *mut VipsImage, width: c_int, ...) -> c_int;
     fn vips_thumbnail_image(input: *mut VipsImage, out: *mut *mut VipsImage, width: c_int, ...) -> c_int;
     fn vips_image_copy_memory(image: *mut VipsImage) -> *mut VipsImage;
@@ -33,6 +34,19 @@ unsafe extern "C" {
         y: c_int,
         ...
     ) -> c_int;
+    fn vips_colourspace(input: *mut VipsImage, out: *mut *mut VipsImage, space: c_int, ...) -> c_int;
+    fn vips_extract_band(input: *mut VipsImage, out: *mut *mut VipsImage, band: c_int, ...) -> c_int;
+    fn vips_hist_equal(input: *mut VipsImage, out: *mut *mut VipsImage, ...) -> c_int;
+    fn vips_extract_area(
+        input: *mut VipsImage,
+        out: *mut *mut VipsImage,
+        left: c_int,
+        top: c_int,
+        width: c_int,
+        height: c_int,
+        ...
+    ) -> c_int;
+    fn vips_image_write_to_memory(input: *mut VipsImage, size: *mut usize) -> *mut c_void;
     fn vips_image_write_to_buffer(
         input: *mut VipsImage,
         suffix: *const c_char,
@@ -40,6 +54,8 @@ unsafe extern "C" {
         size: *mut usize,
         ...
     ) -> c_int;
+    #[cfg(test)]
+    fn vips_invert(input: *mut VipsImage, out: *mut *mut VipsImage, ...) -> c_int;
     #[cfg(test)]
     fn vips_black(out: *mut *mut VipsImage, width: c_int, height: c_int, ...) -> c_int;
     fn g_object_unref(object: *mut c_void);
@@ -186,6 +202,50 @@ impl<'a> Image<'a> {
         wrap(status, out)
     }
 
+    /// Greyscale, histogram-equalised, alpha dropped: what the face detector expects.
+    pub fn equalised_grey(&self) -> Result<Self, VipsError> {
+        const VIPS_INTERPRETATION_B_W: c_int = 1;
+        let mut grey = ptr::null_mut();
+        // SAFETY: self is a live image.
+        let grey =
+            wrap(unsafe { vips_colourspace(self.ptr.as_ptr(), &mut grey, VIPS_INTERPRETATION_B_W, NULL) }, grey)?;
+        let mut band = ptr::null_mut();
+        // SAFETY: grey is a live image.
+        let band = wrap(unsafe { vips_extract_band(grey.ptr.as_ptr(), &mut band, 0, NULL) }, band)?;
+        let mut out = ptr::null_mut();
+        // SAFETY: band is a live image.
+        let status = unsafe { vips_hist_equal(band.ptr.as_ptr(), &mut out, NULL) };
+        wrap(status, out)
+    }
+
+    pub fn extract_area(&self, left: i32, top: i32, width: i32, height: i32) -> Result<Self, VipsError> {
+        let mut out = ptr::null_mut();
+        // SAFETY: self is a live image.
+        let status = unsafe { vips_extract_area(self.ptr.as_ptr(), &mut out, left, top, width, height, NULL) };
+        wrap(status, out)
+    }
+
+    /// Whether the EXIF orientation swaps width and height (thumbnailing applies it).
+    pub fn orientation_swaps(&self) -> bool {
+        // SAFETY: self is a live image.
+        unsafe { vips_image_get_orientation_swap(self.ptr.as_ptr()) != 0 }
+    }
+
+    /// Runs the pipeline and returns the raw pixels, bands interleaved.
+    pub fn pixels(&self) -> Result<Vec<u8>, VipsError> {
+        let mut len = 0;
+        // SAFETY: on success libvips hands us a g_malloc'd buffer of `len` bytes, freed below.
+        unsafe {
+            let buf = vips_image_write_to_memory(self.ptr.as_ptr(), &mut len);
+            if buf.is_null() {
+                return Err(last_error());
+            }
+            let bytes = std::slice::from_raw_parts(buf.cast::<u8>(), len).to_vec();
+            g_free(buf);
+            Ok(bytes)
+        }
+    }
+
     pub fn width(&self) -> i32 {
         // SAFETY: self is a live image.
         unsafe { vips_image_get_width(self.ptr.as_ptr()) }
@@ -217,6 +277,14 @@ impl<'a> Image<'a> {
         let mut out = ptr::null_mut();
         // SAFETY: allocates a new image with no borrowed input.
         let status = unsafe { vips_black(&mut out, width, height, c"bands".as_ptr(), 3 as c_int, NULL) };
+        wrap(status, out)
+    }
+
+    #[cfg(test)]
+    pub fn invert(&self) -> Result<Self, VipsError> {
+        let mut out = ptr::null_mut();
+        // SAFETY: self is a live image.
+        let status = unsafe { vips_invert(self.ptr.as_ptr(), &mut out, NULL) };
         wrap(status, out)
     }
 }

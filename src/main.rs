@@ -1,3 +1,4 @@
+mod face;
 mod transform;
 mod vips;
 

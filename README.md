@@ -84,6 +84,7 @@ curl --data-binary @photo.jpg -o out.webp \
 | `width`   | 1–8192                                  | unbounded        |
 | `height`  | 1–8192                                  | unbounded        |
 | `fit`     | `scale-down`, `cover`, `crop`, `blur`   | `scale-down`     |
+| `gravity` | `centre` (`center`), `face`             | `centre`         |
 | `format`  | `jpeg` (`jpg`), `png`, `webp`, `avif`   | same as input    |
 | `quality` | 1–100 (encoder-native scale)            | JPEG 78, WebP 83, AVIF 62–69 (by speed), PNG lossless |
 
@@ -91,6 +92,10 @@ curl --data-binary @photo.jpg -o out.webp \
 - `cover`: fill `width`×`height` exactly (enlarging if needed) and centre-crop the overflow.
 - `crop`: like `cover` but never enlarges; an axis smaller than the box stays as is.
 - `blur`: fit inside the box without enlarging, over a blurred copy of the image filling the whole box.
+- `gravity` picks what `cover` and `crop` keep in frame. `face` looks for anime-style faces (illustrations,
+  VRChat-style avatars) and centres the crop on the most confident one, as far as the image edges allow; with no
+  face found it falls back to `centre`. Faces smaller than about 5% of the image's long edge are missed.
+  Detection adds a small decode of the input (~40 ms on the bench images).
 - `cover` / `crop` / `blur` need both `width` and `height`; with only one they behave like `scale-down`.
 - For PNG, an explicit `quality` switches to palette quantisation (lossy, much smaller).
 - `quality` is passed to the encoder as is, and each encoder's scale differs. The defaults are calibrated to
@@ -135,11 +140,9 @@ DURATION=30s CONNECTIONS=32 URL=http://host:8080 bench/bench.sh photo.jpg
 Prints req/s, p50/p99 latency, output size and success rate for each image and query.
 On laptops, thermal throttling skews req/s between consecutive runs; compare CPU time per request when tuning.
 
-## Roadmap
-
-- Content-aware cropping (faces, salient regions). Cropping already goes through libvips `thumbnail`'s
-  `crop` option, which also accepts `attention`. Face detection would plug in at the same point.
-
 ## License
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT) at your option.
+
+`gravity=face` uses [lbpcascade_animeface](https://github.com/nagadomi/lbpcascade_animeface) by nagadomi
+(MIT, see the header of `src/lbpcascade_animeface.xml`).
